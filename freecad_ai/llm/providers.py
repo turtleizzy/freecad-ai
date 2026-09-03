@@ -144,6 +144,12 @@ PROVIDERS = {
         "api_style": "openai",
         "supports_tools": True,
     },
+    "codex-router": {
+        "base_url": "http://127.0.0.1:4203/v1",
+        "default_model": "deepseek-v4-flash",
+        "api_style": "openai",
+        "supports_tools": True,
+    },
     "custom": {
         "base_url": "",
         "default_model": "",

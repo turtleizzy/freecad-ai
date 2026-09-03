@@ -40,6 +40,10 @@ def _make_fake_dialog(base_url="http://gateway.example/v1", model="my-model"):
     return SimpleNamespace(
         base_url_edit=base_url_edit,
         model_edit=model_edit,
+        model_combo=MagicMock(),
+        model_stack=MagicMock(),
+        model_refresh_btn=MagicMock(),
+        model_status=MagicMock(),
         _load_model_params_table=MagicMock(),
         _rerank_at_factory_defaults=MagicMock(return_value=False),
         _apply_rerank_defaults=MagicMock(),
@@ -62,6 +66,24 @@ def test_switch_to_custom_preserves_fields():
     fake._load_model_params_table.assert_called_once()
     args, _ = fake._load_model_params_table.call_args
     assert args[0] == "my-model"
+
+
+def test_switch_to_codex_router_refreshes_models():
+    """The Codex Router provider applies its preset and requests a model list."""
+    fake = _make_fake_dialog()
+    fake._refresh_codex_router_models = MagicMock()
+    codex_idx = get_provider_names().index("codex-router")
+
+    with patch("freecad_ai.ui.settings_dialog.get_config", return_value=MagicMock()):
+        SettingsDialog._on_provider_changed(cast(SettingsDialog, fake), codex_idx)
+
+    fake.base_url_edit.setText.assert_called_once_with(
+        PROVIDER_PRESETS["codex-router"]["base_url"])
+    fake.model_edit.setText.assert_called_once_with(
+        PROVIDER_PRESETS["codex-router"]["default_model"])
+    fake.model_stack.setCurrentIndex.assert_called_once_with(1)
+    fake.model_refresh_btn.setVisible.assert_called_once_with(True)
+    fake._refresh_codex_router_models.assert_called_once()
 
 
 def test_switch_to_real_provider_applies_preset():

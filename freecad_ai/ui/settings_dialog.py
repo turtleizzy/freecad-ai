@@ -3,7 +3,7 @@
 Provides a GUI for configuring:
   - LLM provider (Anthropic, OpenAI, Ollama, Gemini, OpenRouter, Moonshot,
     DeepSeek, Qwen, Groq, Mistral, Together, Fireworks, xAI, Cohere,
-    SambaNova, MiniMax, Custom)
+    SambaNova, MiniMax, Codex Router, Custom)
   - API key, base URL, model name
   - Max tokens, temperature
   - Auto-execute toggle
@@ -66,6 +66,30 @@ class _TestConnectionThread(QThread):
             self.capabilities_result.emit(caps)
         except Exception as e:
             self.finished.emit(False, str(e))
+
+
+class _ModelListThread(QThread):
+    """Background thread for fetching OpenAI-compatible model catalogs."""
+
+    finished = Signal(bool, object, str)
+
+    def __init__(self, base_url: str, api_key: str, parent=None):
+        super().__init__(parent)
+        self._base_url = base_url
+        self._api_key = api_key
+
+    def run(self):
+        try:
+            from ..llm.client import LLMClient
+            client = LLMClient(
+                provider_name="codex-router",
+                base_url=self._base_url,
+                api_key=self._api_key,
+                model="",
+            )
+            self.finished.emit(True, client.list_models(), "")
+        except Exception as e:
+            self.finished.emit(False, None, str(e))
 
 
 class _TestRerankerThread(QThread):
@@ -180,6 +204,7 @@ class SettingsDialog(QDialog):
         self.setMinimumHeight(400)
         self.resize(540, 700)
         self._test_thread = None
+        self._model_list_thread = None
         self._last_default_prompt = ""
         self._rerank_last_model = ""
         self._build_ui()
@@ -225,9 +250,60 @@ class SettingsDialog(QDialog):
 
         self.model_edit = QLineEdit()
         self.model_edit.setPlaceholderText(translate("SettingsDialog", "Model name"))
+        self.model_edit.setToolTip(translate(
+            "SettingsDialog",
+            "Codex Router uses gateway model IDs from /v1/models,\n"
+            "not the display slugs shown in the Codex picker."
+        ))
         self.model_edit.editingFinished.connect(self._on_model_changed)
+
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(True)
+        self.model_combo.setInsertPolicy(QComboBox.NoInsert)
+        combo_edit = self.model_combo.lineEdit()
+        combo_edit.setPlaceholderText(translate("SettingsDialog", "Model name"))
+        combo_edit.setToolTip(translate(
+            "SettingsDialog",
+            "Codex Router uses gateway model IDs from /v1/models,\n"
+            "not the display slugs shown in the Codex picker."
+        ))
+        combo_edit.editingFinished.connect(self._on_model_combo_edit_finished)
+        self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
+
+        self.model_refresh_btn = QPushButton()
+        self.model_refresh_btn.setIcon(QtGui.QIcon.fromTheme("view-refresh"))
+        self.model_refresh_btn.setToolTip(translate(
+            "SettingsDialog",
+            "Refresh Codex Router model list"
+        ))
+        self.model_refresh_btn.setFixedSize(30, 26)
+        self.model_refresh_btn.clicked.connect(self._refresh_codex_router_models)
+        self.model_refresh_btn.setVisible(False)
+
+        self.model_status = QLabel()
+        self.model_status.setStyleSheet("color: #c62828;")
+        self.model_status.setToolTip(translate(
+            "SettingsDialog",
+            "Only providers reporting credential_present=true in codex-router /health are shown.\n"
+            "GPT-5.6 routes appear when commandcode or opencode provider credentials are enabled."
+        ))
+        self.model_status.hide()
+
+        model_row_layout = QHBoxLayout()
+        self.model_stack = QtWidgets.QStackedWidget()
+        self.model_stack.addWidget(self.model_edit)
+        self.model_stack.addWidget(self.model_combo)
+        model_row_layout.addWidget(self.model_stack, 1)
+        model_row_layout.addWidget(self.model_refresh_btn)
+        model_layout = QVBoxLayout()
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.addLayout(model_row_layout)
+        model_layout.addWidget(self.model_status)
+        model_widget = QWidget()
+        model_widget.setLayout(model_layout)
+
         self._last_model_name = ""  # track model name for param save/load
-        provider_layout.addRow(translate("SettingsDialog", "Model:"), self.model_edit)
+        provider_layout.addRow(translate("SettingsDialog", "Model:"), model_widget)
 
         provider_group.setLayout(provider_layout)
         layout.addWidget(provider_group)
@@ -879,7 +955,9 @@ class SettingsDialog(QDialog):
             idx = names.index(cfg.provider.name)
         except ValueError:
             idx = 0
+        self.provider_combo.blockSignals(True)
         self.provider_combo.setCurrentIndex(idx)
+        self.provider_combo.blockSignals(False)
 
         self.api_key_edit.setText(cfg.provider.api_key)
         self.base_url_edit.setText(cfg.provider.base_url)
@@ -923,6 +1001,18 @@ class SettingsDialog(QDialog):
 
         # Strip thinking history — tristate: PartiallyChecked=auto, Checked=on, Unchecked=off
         self._update_strip_thinking_ui(cfg.strip_thinking_history)
+
+        if cfg.provider.name == "codex-router":
+            self.model_stack.setCurrentIndex(1)
+            self.model_refresh_btn.setVisible(True)
+            self.model_combo.blockSignals(True)
+            self.model_combo.setCurrentText(cfg.provider.model)
+            self.model_combo.blockSignals(False)
+            self._refresh_codex_router_models()
+        else:
+            self.model_stack.setCurrentIndex(0)
+            self.model_refresh_btn.setVisible(False)
+            self._clear_model_combo()
 
         # System prompt text: show override if set, otherwise generate default
         default_prompt = self._get_default_prompt_text()
@@ -989,6 +1079,18 @@ class SettingsDialog(QDialog):
             if new_model:
                 self.model_edit.setText(new_model)
 
+            if name == "codex-router":
+                self.model_stack.setCurrentIndex(1)
+                self.model_refresh_btn.setVisible(True)
+                self.model_combo.blockSignals(True)
+                self.model_combo.setCurrentText(self.model_edit.text())
+                self.model_combo.blockSignals(False)
+                self._refresh_codex_router_models()
+            else:
+                self.model_stack.setCurrentIndex(0)
+                self.model_refresh_btn.setVisible(False)
+                self._clear_model_combo()
+
             # Load saved params for the (possibly preserved) model
             cfg = get_config()
             self._load_model_params_table(self.model_edit.text(), cfg)
@@ -1002,6 +1104,81 @@ class SettingsDialog(QDialog):
             rerank_defaults = preset.get("default_rerank", {})
             if rerank_defaults and self._rerank_at_factory_defaults():
                 self._apply_rerank_defaults(rerank_defaults)
+
+    def _clear_model_combo(self):
+        """Remove Codex Router choices when another provider is active."""
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self.model_combo.setCurrentText("")
+        self.model_combo.blockSignals(False)
+        self.model_status.hide()
+
+    def _refresh_codex_router_models(self):
+        """Fetch the current Codex Router model catalog in the background."""
+        names = get_provider_names()
+        idx = self.provider_combo.currentIndex()
+        provider = names[idx] if 0 <= idx < len(names) else ""
+        if provider != "codex-router":
+            return
+        if self._model_list_thread is not None and self._model_list_thread.isRunning():
+            return
+
+        base_url = self.base_url_edit.text().strip()
+        api_key = self.api_key_edit.text().strip()
+        if not base_url:
+            self.model_status.setText(translate(
+                "SettingsDialog", "Model list unavailable: Base URL is empty"))
+            self.model_status.show()
+            return
+
+        self.model_refresh_btn.setEnabled(False)
+        self.model_status.setText(translate("SettingsDialog", "Loading models..."))
+        self.model_status.setStyleSheet("color: #666;")
+        self.model_status.show()
+        self._model_list_thread = _ModelListThread(base_url, api_key, self)
+        self._model_list_thread.finished.connect(self._on_model_list_finished)
+        self._model_list_thread.start()
+
+    def _on_model_list_finished(self, success: bool, models, error: str):
+        """Populate the model combo after a catalog request finishes."""
+        self.model_refresh_btn.setEnabled(True)
+        if not success:
+            self.model_status.setText(translate("SettingsDialog", "Model list error: ") + error)
+            self.model_status.setStyleSheet("color: #c62828;")
+            self.model_status.show()
+            return
+        if not models:
+            self.model_status.setText(translate("SettingsDialog", "No models returned"))
+            self.model_status.setStyleSheet("color: #c62828;")
+            self.model_status.show()
+            return
+
+        current = self.model_edit.text().strip()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model in models:
+            self.model_combo.addItem(str(model))
+        selected = self.model_combo.findText(current) if current else -1
+        if selected >= 0:
+            self.model_combo.setCurrentIndex(selected)
+        elif self.model_combo.count():
+            self.model_combo.setCurrentIndex(0)
+        self.model_combo.blockSignals(False)
+        self.model_status.setText(translate(
+            "SettingsDialog", "Showing {} available models").format(len(models)))
+        self.model_status.setStyleSheet("color: #666;")
+        self.model_status.show()
+        self._on_model_changed()
+
+    def _on_model_combo_changed(self, _index: int):
+        """Keep model parameters in sync when a dropdown model is chosen."""
+        self.model_edit.setText(self.model_combo.currentText())
+        self._on_model_changed()
+
+    def _on_model_combo_edit_finished(self):
+        """Keep model parameters in sync after typing a custom router model."""
+        self.model_edit.setText(self.model_combo.currentText())
+        self._on_model_changed()
 
     def _rerank_at_factory_defaults(self) -> bool:
         """True if the rerank UI matches AppConfig's factory defaults."""

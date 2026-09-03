@@ -256,6 +256,83 @@ class LLMClient:
         test_messages = [{"role": "user", "content": "Say 'hello' in one word."}]
         return self.send(test_messages, system="Respond briefly.")
 
+    def _http_get_json(self, url: str) -> dict:
+        """GET a JSON document from an OpenAI-compatible service."""
+        self._check_ssl(url)
+        req = urllib.request.Request(url, headers=self._openai_headers(), method="GET")
+        context = self._ssl_ctx if url.startswith("https") else None
+        try:
+            with urllib.request.urlopen(req, context=context, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as e:
+            raise LLMError(f"Failed to GET {url}: {e}") from e
+
+    @staticmethod
+    def _enabled_router_providers(health: dict) -> set[str]:
+        """Return provider IDs that report a usable local credential."""
+        providers = health.get("providers", {}) if isinstance(health, dict) else {}
+        if not isinstance(providers, dict):
+            return set()
+        return {
+            str(provider_id)
+            for provider_id, status in providers.items()
+            if isinstance(status, dict) and status.get("credential_present") is True
+        }
+
+    @staticmethod
+    def _model_is_available(entry: dict, provider_ids: set[str]) -> bool:
+        """Match a gateway model to one of the enabled local providers.
+
+        Codex Router health reports provider IDs, while /models reports a
+        display owner. Gateway IDs are provider-prefixed, so matching either
+        the prefix or the owner covers both shapes without hard-coding model
+        families.
+        """
+        model_id = str(entry.get("id", ""))
+        owned_by = str(entry.get("owned_by", ""))
+        return any(
+            model_id.startswith(f"{provider_id}-") or owned_by == provider_id
+            for provider_id in provider_ids
+        )
+
+    def list_model_entries(self) -> list[dict]:
+        """List model entries, annotated with local Codex Router availability."""
+        url = f"{self.base_url}/models"
+        data = self._http_get_json(url)
+
+        items = data.get("data", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            raise LLMError("Unexpected model-list response format.")
+
+        entries = [
+            {
+                "id": str(item["id"]),
+                "owned_by": str(item.get("owned_by", "")),
+                "available": True,
+            }
+            for item in items
+            if isinstance(item, dict) and item.get("id")
+        ]
+
+        if self.provider_name != "codex-router":
+            return entries
+
+        base = self.base_url
+        if base.endswith("/v1"):
+            base = base[:-3]
+        health = self._http_get_json(f"{base}/health")
+        provider_ids = self._enabled_router_providers(health)
+        for entry in entries:
+            entry["available"] = self._model_is_available(entry, provider_ids)
+        return entries
+
+    def list_models(self, available_only: bool = True) -> list[str]:
+        """List model IDs, optionally limited to locally enabled providers."""
+        entries = self.list_model_entries()
+        if available_only:
+            entries = [entry for entry in entries if entry.get("available")]
+        return [str(entry["id"]) for entry in entries]
+
     def _ollama_capabilities(self) -> set[str] | None:
         """Query Ollama's /api/show for the model's capabilities array.
 

@@ -195,6 +195,12 @@ class TestProviderPresets:
         gh = PROVIDER_PRESETS["github"]
         assert gh["default_rerank"] == {"method": "keyword", "top_n": 8}
 
+    def test_codex_router_preset(self):
+        """Codex Router is a loopback OpenAI-compatible provider."""
+        preset = PROVIDER_PRESETS["codex-router"]
+        assert preset["base_url"] == "http://127.0.0.1:4203/v1"
+        assert preset["default_model"] == "deepseek-v4-flash"
+
     def test_default_rerank_is_empty_for_other_providers(self):
         """Only the github preset ships a reranker recommendation today.
 
