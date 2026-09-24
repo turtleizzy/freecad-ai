@@ -24,7 +24,8 @@ class FreeCADAIWorkbench(Gui.Workbench):
                                           "FreeCADAI_ToggleMCPServer"])
         self.appendMenu("FreeCAD AI", ["FreeCADAI_OpenChat", "FreeCADAI_OpenSettings",
                                        "FreeCADAI_ToggleMCPServer",
-                                       "FreeCADAI_ToggleKeepDock"])
+                                       "FreeCADAI_ToggleKeepDock",
+                                       "FreeCADAI_RestoreBackup"])
 
     def Activated(self):
         """Called when the workbench is selected."""
@@ -129,6 +130,34 @@ class OpenSettingsCommand:
         return True
 
 
+class RestoreBackupCommand:
+    """Command to open a pre-execution recovery snapshot (#49).
+
+    Menu only, not the toolbar: recovery is a rare and deliberate act, and a
+    button sitting beside the everyday chat and settings icons is one stray
+    click away from a file dialog nobody asked for.
+    """
+
+    def GetResources(self):
+        from freecad_ai.i18n import translate
+        return {
+            "GroupName": "FreeCAD AI",
+            "MenuText": translate("RestoreBackupCommand", "Restore from Backup..."),
+            "ToolTip": translate(
+                "RestoreBackupCommand",
+                "Open a copy of an automatic snapshot taken before the AI ran code"),
+        }
+
+    def Activated(self, index=0):
+        from freecad_ai.ui.restore_dialog import show_restore_dialog
+        show_restore_dialog(Gui.getMainWindow())
+
+    def IsActive(self):
+        # Deliberately unconditional: recovering after a crash is exactly the
+        # case where no document is open to gate on.
+        return True
+
+
 class ToggleKeepDockCommand:
     """Command to toggle 'keep chat panel open across workbench switches'.
 
@@ -158,18 +187,13 @@ class ToggleKeepDockCommand:
         cfg = get_config()
         cfg.keep_dock_on_workbench_switch = not cfg.keep_dock_on_workbench_switch
         save_current_config()
-        # Make the change visible right away: showing when turned on,
-        # hiding when turned off.
-        from freecad_ai.ui.chat_widget import get_chat_dock
-        if cfg.keep_dock_on_workbench_switch:
-            dock = get_chat_dock()
-            if dock:
-                dock.show()
-                dock.raise_()
-        else:
-            dock = get_chat_dock(create=False)
-            if dock:
-                dock.hide()
+        # Nothing is shown or hidden here. This setting governs what
+        # Deactivated() does when you *leave* the workbench; the panel's
+        # visibility right now is the Open AI Chat command's business.
+        # Unticking used to hide the panel on the spot -- inside the one
+        # workbench the panel belongs to -- which is not what "keep open when
+        # switching workbenches" means. The Settings dialog changes the same
+        # flag and never touched visibility; this now agrees with it.
         self._sync_action()
 
     def _sync_action(self):
@@ -353,4 +377,5 @@ Gui.addCommand("FreeCADAI_OpenChat", OpenChatCommand())
 Gui.addCommand("FreeCADAI_OpenSettings", OpenSettingsCommand())
 Gui.addCommand("FreeCADAI_ToggleKeepDock", ToggleKeepDockCommand())
 Gui.addCommand("FreeCADAI_ToggleMCPServer", ToggleMCPServerCommand())
+Gui.addCommand("FreeCADAI_RestoreBackup", RestoreBackupCommand())
 Gui.addWorkbench(FreeCADAIWorkbench())

@@ -32,7 +32,7 @@ import shutil
 import sys
 import time
 import time
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, field, fields, is_dataclass
 
 
 logger = logging.getLogger(__name__)
@@ -429,6 +429,77 @@ def _profile_from_dict(raw) -> "ProviderConfig":
     return ProviderConfig(**{k: v for k, v in raw.items() if k in known})
 
 
+_OMIT = object()          # "this value cannot go in the file"
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _to_jsonable(value, path, active, dropped):
+    """Convert a config value into something ``json.dump`` can write.
+
+    This replaces ``dataclasses.asdict``, which is the wrong tool for a
+    tree headed to a JSON file: it has no cycle detection, and for any
+    value it does not recognise it falls back to ``copy.deepcopy``. #88
+    showed what that costs. One unexpected object in the config -- or one
+    reference back up the tree -- raised RecursionError from inside
+    asdict(), and since the caller had already opened config.json for
+    writing, the user was left with a zero-byte file: every setting, every
+    profile and every API key gone.
+
+    A value deepcopy cannot handle was never going to reach the file
+    anyway, so it is dropped and recorded rather than raised on. The rest
+    of the configuration still saves.
+
+    ``active`` holds the ids on the *current branch*, not every id seen:
+    the same profile object reached twice by two different paths is
+    ordinary sharing, while the same object reached from inside itself is
+    the cycle that has to stop.
+    """
+    if isinstance(value, _JSON_SCALARS):
+        return value
+
+    vid = id(value)
+    if vid in active:
+        dropped.append((path, "a reference back into itself"))
+        return _OMIT
+    active.add(vid)
+    try:
+        if is_dataclass(value) and not isinstance(value, type):
+            out = {}
+            for f in fields(value):
+                item = _to_jsonable(
+                    getattr(value, f.name), _join(path, f.name), active, dropped)
+                if item is not _OMIT:
+                    out[f.name] = item
+            return out
+        if isinstance(value, dict):
+            out = {}
+            for k, v in value.items():
+                if not isinstance(k, _JSON_SCALARS):
+                    dropped.append((_join(path, "<key>"),
+                                    f"a {type(k).__name__} key"))
+                    continue
+                item = _to_jsonable(v, _join(path, k), active, dropped)
+                if item is not _OMIT:
+                    out[k] = item
+            return out
+        if isinstance(value, (list, tuple)):
+            out = []
+            for i, v in enumerate(value):
+                item = _to_jsonable(v, _join(path, i), active, dropped)
+                if item is not _OMIT:
+                    out.append(item)
+            return out
+    finally:
+        active.discard(vid)
+
+    dropped.append((path, f"a {type(value).__name__}"))
+    return _OMIT
+
+
+def _join(path: str, part) -> str:
+    return f"{path}.{part}" if path else str(part)
+
+
 @dataclass
 class AppConfig:
     profiles: dict = field(default_factory=dict)      # label -> ProviderConfig
@@ -461,6 +532,15 @@ class AppConfig:
     enable_tools: bool = True
     thinking: str = "off"  # "off", "on", "extended"
     strip_thinking_history: bool | None = None  # None=auto-detect, True/False=override
+    # Keep each turn's reasoning_content in the stored history, so the next
+    # request re-sends what the provider was already shown. The one Behavior
+    # switch that ships ON: Moonshot's engineers report a measurable drop in
+    # reply quality on turns whose reasoning is missing, in ordinary chat and
+    # not just tool loops (forum thread 602), so the conservative-looking
+    # default is the one that degrades answers. Off is an escape hatch, and
+    # strip_thinking_history still wins -- a model that rejects the key never
+    # receives it whatever this says.
+    preserve_reasoning_history: bool = True
     viewport_capture: str = "off"  # "off", "every_message", "after_changes"
     viewport_resolution: str = "medium"  # "low", "medium", "high"
     mcp_servers: list = field(default_factory=list)
@@ -483,6 +563,12 @@ class AppConfig:
     # default) leaves the server unauthenticated, same as before this field
     # existed. MCP_AUTH_TOKEN overrides.
     mcp_server_auth_token: str = ""
+    # tools/list freshness hints (2026-07-28 CacheableResult). Both fields are
+    # REQUIRED on the wire, so "do not cache" is ttl 0, not an empty value.
+    # Defaults duplicated from freecad_ai.mcp.protocol: config.py must not
+    # import the mcp package. A test pins the two together.
+    mcp_server_tools_ttl_ms: int = 300000
+    mcp_server_tools_cache_scope: str = "private"
     user_tools_disabled: list = field(default_factory=list)
     scan_freecad_macros: bool = False
     # Dangerous mode: relaxes executor safety layers (static pattern blocking,
@@ -498,6 +584,35 @@ class AppConfig:
     # an MDI sub-window of the main window.
     use_external_editor: bool = False
     system_prompt_override: str = ""  # empty = use default; non-empty = use as-is
+    # AGENTS.md scoping (#94). False (default, and the behaviour since the
+    # loader was written) = the first instruction file found wins, so a
+    # project AGENTS.md next to the .FCStd silently replaces the global one
+    # in the config dir. True = every file in the chain is concatenated,
+    # least specific first, so a project file adds to your defaults instead
+    # of taking their place.
+    merge_agents_md: bool = False
+
+    # ── Prompt caching (#47) ────────────────────────────────────
+    # Every provider that discounts repeated prompts matches on a *prefix*
+    # and stops at the first differing byte. The live document state used
+    # to sit at the top of the system prompt, ahead of the instructions and
+    # the ~12.5k tool block, so one added feature invalidated the whole
+    # cacheable run on the next turn.
+    #
+    # Two switches, not one: the first only measures, the second only
+    # changes. Turning them on together would leave no way to tell whether
+    # the numbers improved because of the optimisation or because usage
+    # reporting had just started. Both default off — prior behaviour.
+    #
+    # Moves the document state to the end of the last user message and (on
+    # Anthropic) marks a cache breakpoint. Same text, later position: what
+    # the model sees genuinely changes, hence opt-in.
+    optimize_prompt_caching: bool = False
+    # Logs input/output and cache read/write token counts per response.
+    # Anthropic reports these unasked; OpenAI-style streaming only sends
+    # them if the request carries stream_options.include_usage, which this
+    # flag adds — so it is a request change, not purely passive.
+    log_token_usage: bool = False
     # LEGACY, unread since capabilities moved onto the profile. Kept in the
     # JSON for one release so a downgrade still finds them, and mirrored
     # from the active profile on save — like the ``provider`` mirror.
@@ -615,13 +730,20 @@ class AppConfig:
     def to_dict(self) -> dict:
         """Serialise, including a legacy ``provider`` mirror.
 
-        ``provider`` is a property now, so asdict() skips it. We write it
+        ``provider`` is a property now, so the field walk skips it. We write it
         anyway for one release: a user who installs this version and then
         downgrades gets their connection back instead of a blank dialog.
         Drop this mirror — and the rerank_llm_*/rerank_params fields —
         one release after profiles ship.
         """
-        data = asdict(self)
+        dropped: list[tuple[str, str]] = []
+        data = _to_jsonable(self, "", set(), dropped)
+        for where, why in dropped:
+            logger.warning(
+                "Dropping %s from config.json: it holds %s, which cannot be "
+                "stored as JSON. The rest of the configuration is saved "
+                "normally. Please report this with the field name above.",
+                where, why)
         data["provider"] = {
             "name": self.provider.name,
             "api_key": self.provider.api_key,
@@ -773,10 +895,28 @@ def load_config() -> AppConfig:
 
 
 def save_config(config: AppConfig):
-    """Save configuration to disk and mirror to FreeCAD's parameter store."""
+    """Save configuration to disk and mirror to FreeCAD's parameter store.
+
+    Serialise first, write second, and write through a temp file. This
+    used to be ``json.dump(config.to_dict(), open(CONFIG_FILE, "w"))``,
+    and Python evaluates that argument *after* the open has truncated the
+    file -- so any failure to serialise left a zero-byte config.json and
+    took every setting with it (#88). Nothing here can now damage what is
+    already on disk: either os.replace swaps in a complete file, or the
+    previous one stays exactly as it was.
+    """
     _ensure_dirs()
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config.to_dict(), f, indent=2)
+    data = config.to_dict()
+    tmp = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     _write_to_param_store(config)
 
 
@@ -793,6 +933,7 @@ def save_config(config: AppConfig):
 _PARAM_PROVIDERS = [
     "anthropic", "openai", "ollama", "gemini", "openrouter",
     "moonshot", "deepseek", "qwen", "groq", "mistral", "together",
+    "cloudflare-workers-ai",
 ]
 _PARAM_MODES = ["plan", "act"]
 _PARAM_THINKING = ["off", "on", "extended"]

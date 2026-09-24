@@ -10,6 +10,7 @@ tool calls on the main thread, feed results back to the LLM.
 """
 
 import json
+import logging
 import time
 
 from .compat import QtWidgets, QtCore, QtGui
@@ -35,7 +36,8 @@ QTextCursor = QtGui.QTextCursor
 from ..config import LOGS_DIR, get_config, prune_oldest_files, save_current_config
 from ..core.conversation import Conversation
 from ..core.executor import extract_code_blocks, extract_truncated_block, execute_code
-from ..core.loop_control import resolve_turn_outcome, should_continue_loop
+from ..core.loop_control import (
+    reasoning_to_persist, resolve_turn_outcome, should_continue_loop)
 from ..core.input_history import InputHistory
 from .message_view import (
     _get_theme_colors,
@@ -50,6 +52,9 @@ from .message_view import (
     render_truncation_warning,
 )
 from .code_review_dialog import CodeReviewDialog
+
+
+logger = logging.getLogger(__name__)
 
 
 # Known binary file magic bytes — prevents misdetecting binary files as text
@@ -209,6 +214,9 @@ class _LLMWorker(QThread):
         self._pending_result = None
         self._max_tool_turns = get_config().max_tool_turns  # 0 = endless
         self._strip_thinking = False  # resolved in run()
+        self._optimize_caching = False  # resolved in run()
+        self._preserve_reasoning = True  # resolved in run()
+        self._final_reasoning = ""  # thinking of the turn that ends the run (#84)
         self._tool_timeline = []  # timing data for summary visualization
         self._response_truncated = False  # response hit the output-token limit
 
@@ -216,9 +224,17 @@ class _LLMWorker(QThread):
         try:
             from ..llm.client import create_client_from_config, should_strip_thinking
             from ..config import get_config as _get_config
-            client = create_client_from_config()
+            # Every request in one conversation carries the same cache key, so
+            # the provider can keep routing them to the cluster that already
+            # holds the prefix (#47). It is the conversation id, which outlives
+            # a save/load, because Moonshot asks for a value that survives
+            # leaving and resuming a session.
+            client = create_client_from_config(
+                cache_key=getattr(self.conversation, "conversation_id", ""))
             self._strip_thinking = should_strip_thinking(
                 client.model, _get_config().strip_thinking_history)
+            self._optimize_caching = _get_config().optimize_prompt_caching
+            self._preserve_reasoning = _get_config().preserve_reasoning_history
 
             # Re-format messages with image interception on worker thread
             if self.conversation and self.describe_fn:
@@ -237,6 +253,13 @@ class _LLMWorker(QThread):
             self._tool_loop(client)
 
         except Exception as e:
+            # The bubble gets the short form; the Report view gets the
+            # stack. #89 arrived as the bare line "'NoneType' object is
+            # not iterable" -- true, and useless: three lines in this
+            # codebase could have produced it, and the reporter had no
+            # way to tell us which. A turn that dies is a bug report
+            # waiting to be written, so leave it something to quote.
+            logger.exception("Chat turn failed: %s", e)
             self.error_occurred.emit(str(e))
 
     def _wrap_describe_fn(self, describe_fn):
@@ -252,12 +275,39 @@ class _LLMWorker(QThread):
         return wrapped
 
     def _simple_stream(self, client):
-        """Stream without tools (original behavior)."""
-        for chunk in client.stream(self.messages, system=self.system_prompt):
+        """Stream without tools — Plan mode, and any provider-less request.
+
+        This reads the *event* stream, the one the tool loop uses. The
+        text-only path used to consume a plain ``Generator[str]``, which
+        has nowhere to put a second kind of content, so it had no channel
+        for reasoning and dropped it (#84) — and a Plan reply is a whole
+        conversation turn, exactly the case Moonshot measured a quality
+        loss on. That generator had no caller left afterwards and is gone.
+
+        ``tools=None`` keeps the request byte-identical: both body builders
+        gate tools behind ``if tools:``, and ``_openai_body`` reaches its
+        ``reasoning_effort`` branch either way.
+        """
+        thinking_parts = []
+        for event in client.stream_with_tools(
+            self.messages, system=self.system_prompt, tools=None
+        ):
             if self.isInterruptionRequested():
                 break
-            self._full_response += chunk
-            self.token_received.emit(chunk)
+            if event.type == "text_delta":
+                self._full_response += event.text
+                self.token_received.emit(event.text)
+            elif event.type == "thinking_delta":
+                thinking_parts.append(event.text)
+                self._thinking_text += event.text
+                self.thinking_received.emit(event.text)
+            elif event.type == "done":
+                break
+        # A Plan reply is the turn that ends the run, so it never reaches
+        # _tool_results; _final_reasoning is how it travels to the writer.
+        self._final_reasoning = reasoning_to_persist(
+            "".join(thinking_parts), self._strip_thinking,
+            self._optimize_caching, self.api_style, self._preserve_reasoning)
         self._response_truncated = client.response_truncated
         self.response_finished.emit(self._full_response)
 
@@ -299,6 +349,15 @@ class _LLMWorker(QThread):
 
             outcome = resolve_turn_outcome(
                 client.response_truncated, tool_calls, self.isInterruptionRequested())
+            if outcome in ("stopped", "truncated", "done"):
+                # A turn that ends the run produced no tool calls, so it is
+                # never appended to _tool_results and its thinking has no
+                # other way out of this loop (#84). Turns that continue are
+                # carried by the _tool_results entry built further down.
+                self._final_reasoning = reasoning_to_persist(
+                    turn_thinking, self._strip_thinking,
+                    self._optimize_caching, self.api_style,
+                    self._preserve_reasoning)
             if outcome == "stopped":
                 self._full_response += "\n\n_⏹ Stopped by user._"
                 self.response_finished.emit(self._full_response)
@@ -425,6 +484,11 @@ class _LLMWorker(QThread):
             # Store tool call info so the parent can update the conversation
             self._tool_results.append({
                 "assistant_text": turn_text,
+                # What the provider was shown for this turn, so the stored
+                # history can re-render it unchanged (#47).
+                "reasoning": reasoning_to_persist(
+                    turn_thinking, self._strip_thinking, self._optimize_caching,
+                    self.api_style, self._preserve_reasoning),
                 "tool_calls": tc_dicts,
                 "results": [
                     {"tool_call_id": tc.id, "content": r["content"] if self.api_style != "anthropic" else r["content"][0]["content"]}
@@ -1954,11 +2018,13 @@ class ChatDockWidget(QDockWidget):
                 tools_schema = self._tool_registry.to_openai_schema(filter_names)
             system_prompt = build_system_prompt(
                 mode=mode, tools_enabled=True,
-                override=cfg.system_prompt_override)
+                override=cfg.system_prompt_override,
+                include_document_context=not cfg.optimize_prompt_caching)
         else:
             self._tool_registry = None
             system_prompt = build_system_prompt(
-                mode=mode, override=cfg.system_prompt_override)
+                mode=mode, override=cfg.system_prompt_override,
+                include_document_context=not cfg.optimize_prompt_caching)
 
         # Build describe_fn for non-vision LLMs
         describe_fn = None
@@ -1989,6 +2055,20 @@ class ChatDockWidget(QDockWidget):
         # sent raw to a provider that would reject them (issue #30). When a
         # describe_fn exists, the worker rebuilds messages with descriptions.
         strip_images = not cfg.supports_vision and describe_fn is None
+        # Prompt caching (#47): the document state was deliberately left out
+        # of the system prompt so the prefix stays byte-identical between
+        # turns. Record it on this turn instead, before rendering, so it is
+        # delivered at the tail where changing it invalidates nothing ahead
+        # of it -- and so every earlier turn renders the bytes it was
+        # already sent with. Recording rather than grafting also means the
+        # worker's vision-fallback re-render (see _LLMWorker.run) keeps it.
+        if cfg.optimize_prompt_caching:
+            from ..core.system_prompt import build_document_context_block
+            self.conversation.attach_document_context(
+                build_document_context_block())
+        else:
+            self.conversation.clear_document_context()
+
         messages = self.conversation.get_messages_for_api(
             api_style=api_style, strip_images=strip_images, strip_thinking=strip)
 
@@ -2161,9 +2241,11 @@ class ChatDockWidget(QDockWidget):
 
     def _store_tool_results(self, full_response=""):
         """Store tool results from worker into conversation. Idempotent — skips if already stored."""
+        final_reasoning = getattr(self._worker, "_final_reasoning", "")
         if not (self._worker and self._worker._tool_results):
             if full_response:
-                self.conversation.add_assistant_message(full_response)
+                self.conversation.add_assistant_message(
+                    full_response, reasoning_content=final_reasoning)
             return
 
         # Guard against double-storage (e.g., if both response_finished and error fire)
@@ -2175,7 +2257,8 @@ class ChatDockWidget(QDockWidget):
             for turn_info in self._worker._tool_results:
                 tc_dicts = turn_info["tool_calls"]
                 self.conversation.add_assistant_message(
-                    turn_info["assistant_text"], tool_calls=tc_dicts
+                    turn_info["assistant_text"], tool_calls=tc_dicts,
+                    reasoning_content=turn_info.get("reasoning"),
                 )
                 for r in turn_info["results"]:
                     self.conversation.add_tool_result(r["tool_call_id"], r["content"])
@@ -2186,7 +2269,8 @@ class ChatDockWidget(QDockWidget):
             )
             final_text = full_response[last_tool_end:] if last_tool_end < len(full_response) else full_response
             if final_text.strip():
-                self.conversation.add_assistant_message(final_text)
+                self.conversation.add_assistant_message(
+                    final_text, reasoning_content=final_reasoning)
         except Exception as e:
             try:
                 import FreeCAD
@@ -2493,10 +2577,21 @@ class ChatDockWidget(QDockWidget):
         from ..core.system_prompt import build_system_prompt
         from ..llm.client import should_strip_thinking
         mode = "plan" if self.mode_combo.currentIndex() == 0 else "act"
-        system_prompt = build_system_prompt(mode=mode)
         cfg = get_config()
+        system_prompt = build_system_prompt(
+            mode=mode,
+            include_document_context=not cfg.optimize_prompt_caching)
         strip = should_strip_thinking(
             cfg.provider.model, cfg.strip_thinking_history)
+        # Same tail delivery as the main send path (#47). The turn being
+        # re-sent is the [System] error message added just above.
+        if cfg.optimize_prompt_caching:
+            from ..core.system_prompt import build_document_context_block
+            self.conversation.attach_document_context(
+                build_document_context_block())
+        else:
+            self.conversation.clear_document_context()
+
         # This retry attached a viewport snapshot above; drop history images
         # for non-vision models so they aren't sent raw (issue #30).
         messages = self.conversation.get_messages_for_api(

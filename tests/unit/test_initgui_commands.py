@@ -30,7 +30,8 @@ def initgui(monkeypatch):
         """Stand-in for Gui.Workbench, which FreeCADAIWorkbench subclasses."""
 
     gui.Workbench = _Workbench
-    gui.addCommand = lambda *a, **k: None
+    registered = {}
+    gui.addCommand = lambda name, obj, *a, **k: registered.__setitem__(name, obj)
     gui.addWorkbench = lambda *a, **k: None
     gui.addPreferencePage = lambda *a, **k: None
     gui.Command = types.SimpleNamespace(get=lambda name: None)
@@ -60,6 +61,7 @@ def initgui(monkeypatch):
     source = (PROJECT_ROOT / "InitGui.py").read_text()
     namespace = {}
     exec(compile(source, "InitGui.py", "exec"), namespace)
+    namespace["_REGISTERED_COMMANDS"] = registered
     return namespace
 
 
@@ -132,8 +134,6 @@ def test_toggling_keep_dock_pushes_the_new_state(initgui, ticks, tmp_config_dir)
     cfg = get_config()
     cfg.keep_dock_on_workbench_switch = True
 
-    # True -> False, which takes the create=False branch and so needs no
-    # QApplication to hide a dock that was never built.
     initgui["ToggleKeepDockCommand"]().Activated()
 
     assert cfg.keep_dock_on_workbench_switch is False
@@ -175,3 +175,113 @@ def test_toggle_reports_a_rejected_allowed_hosts_list(initgui, ticks,
     assert isinstance(reported[0], ValueError)
     assert "*" in str(reported[0])
     assert ticks["FreeCADAI_ToggleMCPServer"] is False
+
+
+# ---------------------------------------------------------------------------
+# Restore from Backup (#49) — menu only, by decision
+# ---------------------------------------------------------------------------
+
+def _shelves(initgui):
+    """Run Initialize() with the shelf calls captured."""
+    wb = initgui["FreeCADAIWorkbench"]()
+    toolbar, menu = {}, {}
+    wb.appendToolbar = lambda name, cmds: toolbar.update({name: cmds})
+    wb.appendMenu = lambda name, cmds: menu.update({name: cmds})
+    wb.Initialize()
+    return toolbar["FreeCAD AI"], menu["FreeCAD AI"]
+
+
+def test_restore_backup_is_reachable_from_the_menu(initgui):
+    """#48 wrote snapshots nothing could read. An unreachable dialog would
+    leave the feature exactly as useful as it was before."""
+    _, menu = _shelves(initgui)
+
+    assert "FreeCADAI_RestoreBackup" in menu
+
+
+def test_restore_backup_stays_off_the_toolbar(initgui):
+    """Deliberate: recovery is a rare, deliberate act, and a one-click button
+    next to the everyday chat and settings icons invites the mis-click."""
+    toolbar, _ = _shelves(initgui)
+
+    assert "FreeCADAI_RestoreBackup" not in toolbar
+
+
+def test_restore_backup_command_is_registered(initgui):
+    """A name in the menu that was never handed to addCommand renders as a
+    dead entry, with no error anywhere."""
+    assert "FreeCADAI_RestoreBackup" in initgui["_REGISTERED_COMMANDS"]
+
+
+def test_restore_backup_is_always_available(initgui):
+    """It must work with no document open — recovering from a crash is
+    precisely the case where nothing is loaded."""
+    assert initgui["RestoreBackupCommand"]().IsActive() is True
+
+
+# ---------------------------------------------------------------------------
+# The setting governs leaving the workbench, and nothing else
+# ---------------------------------------------------------------------------
+
+class _FakeDock:
+    def __init__(self):
+        self.calls = []
+
+    def show(self):
+        self.calls.append("show")
+
+    def hide(self):
+        self.calls.append("hide")
+
+    def raise_(self):
+        self.calls.append("raise_")
+
+
+@pytest.fixture
+def dock(monkeypatch):
+    """Stand in for the chat dock and record what is done to it."""
+    import freecad_ai.ui.chat_widget as chat_widget
+    fake = _FakeDock()
+    monkeypatch.setattr(chat_widget, "get_chat_dock", lambda create=True: fake)
+    return fake
+
+
+@pytest.mark.parametrize("before", [True, False])
+def test_toggling_keep_dock_leaves_the_panel_where_it_is(
+        initgui, ticks, tmp_config_dir, dock, before):
+    """Unticking it used to hide the panel on the spot.
+
+    That happens inside the FreeCAD AI workbench -- the one workbench the
+    panel belongs to -- so the panel vanished the moment the setting was
+    turned off, which is not what "keep open when switching workbenches"
+    means. The Settings dialog changes the same flag and never touched
+    visibility; the menu entry now agrees with it. Showing and hiding the
+    panel is the Open AI Chat command's job.
+    """
+    from freecad_ai.config import get_config
+    get_config().keep_dock_on_workbench_switch = before
+
+    initgui["ToggleKeepDockCommand"]().Activated()
+
+    assert dock.calls == []
+
+
+def test_leaving_the_workbench_hides_the_panel_when_the_flag_is_off(
+        initgui, tmp_config_dir, dock):
+    from freecad_ai.config import get_config
+    get_config().keep_dock_on_workbench_switch = False
+
+    initgui["FreeCADAIWorkbench"].Deactivated(None)
+
+    assert dock.calls == ["hide"]
+
+
+def test_leaving_the_workbench_keeps_the_panel_when_the_flag_is_on(
+        initgui, tmp_config_dir, dock):
+    """This is the whole point of the setting."""
+    from freecad_ai.config import get_config
+    get_config().keep_dock_on_workbench_switch = True
+
+    initgui["FreeCADAIWorkbench"].Deactivated(None)
+
+    assert dock.calls == []

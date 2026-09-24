@@ -7,6 +7,503 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **A project `AGENTS.md` can now add to your global one instead of replacing
+  it (#94).** The loader searches the active document's directory, up to three
+  parents, and then the user config directory — and has always returned the
+  *first* file it found. So the moment a project grew an `AGENTS.md` next to
+  its `.FCStd`, the global `<FreeCADAI dir>/AGENTS.md` silently stopped being
+  sent: no warning, nothing in the Report view, the prompt just got smaller.
+  The two files are different scopes, not alternatives — the global one holds
+  facts about you, the project one holds facts about the project.
+
+  Set `"merge_agents_md": true` in `config.json` and every instruction file in
+  the chain is concatenated, **least specific first**: user config, then the
+  root-most parent, down to the document's own directory. Later text in a
+  prompt carries more weight, so a project file still overrides a global
+  default — the ordering preserves the precedence that first-wins gave, rather
+  than inverting it.
+
+  Defaults to `false`, so an existing install behaves exactly as it did before.
+  Include directives are now resolved per file, against the directory that
+  file was found in; previously a single base directory was computed for the
+  whole load, which in merge mode would hand every file the same neighbour.
+
+## [0.30.0-alpha] - 2026-09-23
+
+### Fixed
+
+- **Switching to the FreeCAD AI workbench no longer recurses until the
+  interpreter runs out of stack, and a failed save can no longer destroy the
+  configuration (#88).** Reported as `RecursionError` out of `save_config`
+  leaving `config.json` **zero bytes** — every setting, every connection
+  profile and every stored API key gone. Three defects had to line up:
+
+  The root cause was in the toolbar ticks, not in the config. FreeCAD 1.1.x
+  never calls a Python command's `IsChecked()`, so each checkable command
+  pushes its own tick with `QAction.setChecked()` at the end of `Activated()`
+  — and Qt hands that state change to everything connected *before*
+  `setChecked` returns, which FreeCAD routes straight back into `Activated()`.
+  Every push therefore synthesised another activation. Selecting the
+  workbench, or toggling **Keep Chat Panel Open**, ran that loop hundreds of
+  levels deep, inverting `keep_dock_on_workbench_switch` and rewriting
+  `config.json` at every level until the stack ran out. The tick is now set
+  with the action's signals blocked, the way FreeCAD's own
+  `Gui::Action::setChecked` does it.
+
+  The resulting `RecursionError` surfaced at whatever unrelated code happened
+  to be running when the limit tripped, which is why it looked like a
+  serialisation bug. It landed in `json.dump(config.to_dict(), f)` inside
+  `with open(CONFIG_FILE, "w")`, and Python evaluates that argument *after*
+  the open has already truncated the file — so the failure took the existing
+  config with it. The config is now built first, written to a temp file, and
+  moved into place with `os.replace`: either a complete file appears, or the
+  previous one is untouched.
+
+  And `to_dict` used `dataclasses.asdict`, which has no cycle detection and
+  falls back to `copy.deepcopy` for anything it does not recognise, so it
+  could exhaust the stack on its own. Serialisation is now JSON-oriented: a
+  value that cannot be written is dropped and its **path is logged**
+  (`profiles.<name>.params.<key>`), the rest of the configuration saves
+  normally, and any future occurrence names its own culprit instead of
+  arriving as a bare traceback.
+
+- **Unticking "Keep Chat Panel Open" no longer closes the chat panel on the
+  spot.** The menu entry hid the panel the moment it was unticked — while
+  still inside the FreeCAD AI workbench, the one workbench the panel belongs
+  to. The setting governs what happens when you *leave* the workbench and
+  nothing else, so it no longer moves the panel in either direction; the
+  Settings dialog, which changes the same flag, never did. Opening and
+  closing the panel remains **Open AI Chat**'s job.
+
+- **A response with an explicit `null` where a list or object was promised no
+  longer kills the turn (#89).** Reported against Xiaomi MiMo, where every
+  chat ended in `Error: 'NoneType' object is not iterable` before a single
+  token was shown, with the tokens billed at the provider. The parser asked
+  for `tool_calls` with a `[]` fallback, but a fallback is only reached when
+  the key is *absent* — a gateway that spells "no tool calls" as
+  `"tool_calls": null` handed back `None`, and iterating it raised. The same
+  trap sat on the streaming `delta` and on each tool call's `function`.
+
+  Not MiMo-specific: any OpenAI-compatible endpoint that sends explicit nulls
+  hit this, in both the streaming and non-streaming paths. A body that still
+  cannot be parsed now reports `Unexpected response format` with the offending
+  JSON attached, instead of a bare `TypeError` with nothing to go on.
+
+- **The same null-handling applied to the Anthropic-style parser.** Nothing
+  was reported against it, but `api_style` is selectable for any custom base
+  URL, so that parser faces third-party gateways too. Two of its traps were
+  quieter than #89's: a `tool_use` block with `"input": null` put
+  `arguments=None` on the tool call and let the executor discover it, and a
+  null `name` announced a call to `None` in the chat. Its streaming generator
+  has no exception handler at all, so a null `delta` there ended the turn
+  outright rather than costing a single chunk.
+
+- **A chat turn that dies now leaves a traceback in the Report view.** The
+  worker caught everything and emitted `str(e)`, so the chat showed one line
+  with no file, no line number and no stack — which is how #89 arrived, as a
+  bare `'NoneType' object is not iterable` from a codebase with three lines
+  that could have produced it. The bubble keeps the short form; the log
+  channel now carries the stack the next report can quote.
+
+### Changed
+
+- **The MCP client now acts on the `tools/list` freshness hints it collects.**
+  A modern server's `ttlMs` says how long its tool list may be reused. Until
+  now the client stored that number and then cached the list for the whole
+  session regardless, so a server that added or removed a tool mid-session
+  stayed invisible, and `ttlMs: 0` — "do not cache" — was ignored outright.
+  Reading the tool list, which happens once per chat turn and on every tool
+  search, now re-lists from the server once the TTL has elapsed.
+
+  A server that sends no hints is never re-listed, so nothing changes for a
+  legacy server. A re-listing that fails keeps the tools already in hand
+  instead of emptying the list, and a server that is down is left alone for
+  30 seconds rather than re-probed on every read.
+
+## [0.29.0-alpha] - 2026-09-20
+
+### Added
+
+- **Dual-era MCP server (#64).** The MCP server now answers the stateless
+  `2026-07-28` revision alongside the `initialize` handshake it has always
+  spoken, from the same `POST /mcp` endpoint. A client says which era it
+  speaks per request, by carrying `io.modelcontextprotocol/protocolVersion`
+  in `params._meta`; a request without it is served exactly as before.
+
+  `server/discover` is implemented — the bootstrap a stateless client uses in
+  place of the handshake. Modern results carry `resultType` and the server's
+  identity in per-result `_meta`, and `tools/list` carries the `ttlMs` and
+  `cacheScope` freshness hints the revision requires.
+
+  A modern request also mirrors its `method` into an `Mcp-Method` header, and
+  its tool name into `Mcp-Name` on `tools/call`, so a proxy or gateway in
+  front of the server can allow or deny a call without parsing the body. The
+  server refuses a request whose headers disagree with its body, or that
+  repeats one of those headers, with `-32020` and HTTP 400 — headers are only
+  worth routing on while what they say is what runs.
+
+- **Configurable `tools/list` cache hints.** `mcp_server_tools_ttl_ms`
+  (default `300000`) and `mcp_server_tools_cache_scope` (default `private`),
+  overridable with `MCP_TOOLS_TTL_MS` and `MCP_TOOLS_CACHE_SCOPE`. Set the
+  TTL to `0` to tell clients not to cache the tool list at all.
+
+- **MCP client: protocol era negotiation.** The client announced `2025-03-26`
+  on every connection and never asked whether the server spoke anything newer,
+  so a stateless `2026-07-28` server — which has no `initialize` at all — could
+  not be used. It now opens with the newest legacy revision it understands, and
+  treats a `-32601` refusal as the signal to probe `server/discover` and switch
+  to the modern era, carrying `_meta` and mirrored headers on every later
+  request. A modern `tools/list`'s `ttlMs`/`cacheScope` freshness hints are
+  captured on the client but not yet acted on — nothing re-lists tools today.
+  Servers that answer `initialize` see exactly the bytes they saw before,
+  apart from the requested version string and, for a non-conformant server
+  whose `initialize` result omits the required `protocolVersion`, the
+  `MCP-Protocol-Version` header that now falls back to it. (#86)
+
+### Fixed
+
+- **An HTTP error status no longer hides the error.** Both HTTP client
+  transports treated any non-2xx response as a failed POST, so a JSON-RPC error
+  a server reported with a 400 or 404 reached callers as a generic internal
+  error with the text `HTTP Error 404: Not Found`. The body is now read and
+  returned — on a request. A notification has no legitimate reply, so an
+  error status on one still fails loudly, as it always did. (#86)
+
+### Changed
+
+- **`initialize` echoes the client's protocol revision** when it is one we
+  speak, instead of always replying `2025-03-26`. A `2025-11-25` client used
+  to be told to negotiate down for no reason. A client that names no version
+  still gets `2025-03-26`, because it asked for nothing to echo; one that
+  names a version we do not speak is answered `2025-11-25`, the newest
+  revision this handshake has to offer.
+
+- **`tools/list` is sorted by name.** It followed registration order, which
+  is import order, so it moved when nothing about the tools had.
+
+- **An unsupported protocol version is now `-32022`**, the revision's
+  `UnsupportedProtocolVersion`, rather than the generic `-32600`, and the
+  rejection carries the request's id instead of a null one.
+
+## [0.28.0-alpha] - 2026-09-18
+
+### Added
+
+- **Restore from Backup (#49).** The workbench has written a recovery snapshot
+  before every `execute_code` since #48, but nothing could read one back, so a
+  bad script still cost you the work the snapshot was taken to protect. The
+  **FreeCAD AI → Restore from Backup...** menu entry now lists the snapshots
+  with the document each came from and when it was taken, and opens the one
+  you pick.
+
+  It restores by **copying**: the snapshot is copied to a path you choose and
+  that copy is opened, labelled `<document> (recovered)`. Your current
+  document and the snapshot itself are both left untouched, so a restore can
+  never be the thing that loses work, and you can open a snapshot purely to
+  compare it against what you have now. Restoring on top of the document the
+  snapshot came from is refused outright; every other destination is yours to
+  pick.
+
+  A snapshot cannot say where it came from — FreeCAD stores `Document.FileName`
+  as a transient property, so an opened snapshot reports only its own path in
+  the backups folder, and the tag in the filename is a one-way hash. The
+  mapping is therefore recorded in an `index.json` beside the snapshots as
+  each one is taken. Snapshots written by earlier versions have no entry and
+  are still listed, named from their own filename; retention prunes snapshots
+  without consulting the index, so the folder — not the index — decides what
+  exists.
+
+### Fixed
+
+- **A recovery snapshot no longer renames your document.** `saveAs` repoints
+  two things at the file it writes, not one: `FileName` and `Label`. The
+  snapshot path was being restored (#45) but the label was not, so every
+  `execute_code` on a saved document silently relabelled it
+  `part.4e8d53db.ai-backup` in the model tree — and the next ordinary save
+  wrote that name into the user's file. Both are now restored. Found while
+  probing FreeCAD's `saveAs` for #49; the existing tests missed it because
+  their fake document modelled only the `FileName` half of the rename.
+
+- **Reasoning is now kept on every turn, not only the ones that called a tool
+  (#84).** v0.27.0-alpha shipped **Keep model reasoning in conversation
+  history** switched on, then reached only assistant turns carrying
+  `tool_calls`. The two text-only turns stored nothing whatever the switch
+  said: the final answer that closes an Act run, and every Plan-mode reply —
+  which is the whole of Plan mode. Since the reason for keeping reasoning is
+  reply quality rather than caching, and Moonshot's measurement covers
+  ordinary multi-turn chat, the setting was not doing what its label said for
+  anyone working in Plan mode.
+
+  Two unrelated causes, one per exit. The non-tool path consumed a text-only
+  stream with nowhere to put a second kind of content, so reasoning was
+  parsed and discarded before it could be stored; it now reads the same event
+  stream Act mode uses, which separates reasoning from the reply. The tool
+  loop accumulated each turn's reasoning but returned out of its exit paths
+  without carrying the last turn's copy anywhere the conversation writer
+  could see it.
+
+  The request sent to the provider is unchanged — Plan mode still sends no
+  tools, and a reasoning model still gets its `reasoning_effort`. Precedence
+  is unchanged and still resolved in one place: **Strip thinking from
+  conversation history** wins, Anthropic is excluded, **Optimize prompt for
+  caching** forces preservation on, and the switch decides the rest.
+
+  One visible change: Plan mode now renders the thinking bubble as the
+  reasoning arrives, the way Act mode always has. Previously those deltas
+  were parsed and dropped, so a thinking model looked idle until its answer
+  began.
+
+### Removed
+
+- **`LLMClient.stream()` and its two text-only SSE parsers.** Moving Plan mode
+  onto the event stream (#84 above) left them with no caller in the workbench;
+  the only code still reaching them was the test that had been guarding Plan
+  mode's truncation warning, which was therefore no longer guarding anything a
+  user can reach. That coverage now runs against the path Plan mode actually
+  takes. Anyone who was calling `stream()` from a hook or a fork can get the
+  same sequence from `stream_with_tools(messages, system, tools=None)` by
+  keeping the events whose `type` is `text_delta`.
+
+## [0.27.0-alpha] - 2026-09-14
+
+### Changed
+
+- **A model's reasoning now stays in the conversation history by default, and
+  has its own switch.** It used to be kept only when **Optimize prompt for
+  caching** was ticked, on the theory that this was a cache optimisation. It
+  is not. Moonshot's engineers report that their benchmarks show *"a clear,
+  measurable drop in response quality"* on turns whose `reasoning_content` is
+  missing — in ordinary multi-turn conversation, not merely in tool-calling
+  chains — and recommend preserving every turn's reasoning whether or not you
+  care about caching ([forum thread
+  602](https://forum.moonshot.ai/t/does-thinking-keep-decide-whether-historical-reasoning-content-counts-toward-the-prefix-cache-on-kimi-k2-6-and-later/602)).
+
+  A default that quietly degrades replies is not a conservative default, so
+  **Settings → Behavior → Keep model reasoning in conversation history** ships
+  **on** — the only switch in this project to do so on arrival. Untick it and
+  the history goes back to exactly what it held before. This is a deliberate
+  departure from the rule that a new setting defaults to prior behaviour: the
+  prior behaviour is the one the vendor measures as worse.
+
+  What you will notice: the reasoning is written to your saved session and
+  session log alongside the rest of the turn, and it is re-sent to the
+  provider, so it counts against your token quota where the provider bills
+  for it. What does not change: models that reject reasoning in history are
+  unaffected — **Strip thinking from conversation history** still wins and
+  still auto-detects them — and Anthropic is untouched, since it carries
+  thinking as its own signed content block that this field cannot represent.
+
+  **Scope, stated plainly: this covers assistant turns that called a tool** —
+  the Act-mode loop, which is where a FreeCAD session spends its requests and
+  what the vendor thread was about. A turn that produced only text still
+  stores no reasoning: the final answer that closes an Act run, and every
+  Plan-mode reply. Moonshot's advice covers those too, so this is a gap and
+  not a boundary; closing it means capturing reasoning separately in the
+  non-tool streaming path, which is a change to the main streaming code and
+  is tracked as [#84](https://github.com/ghbalf/freecad-ai/issues/84) rather
+  than folded in here.
+
+### Added
+
+- **Requests now ask to be routed back to the cache they filled (#47).** A
+  byte-perfect prefix is necessary but not sufficient. Moonshot's engineers
+  describe a backend of many clusters, each holding its own cache blocks: a
+  follow-up balanced onto a cluster that never saw your conversation pays full
+  price however careful the client was with its bytes. Both Moonshot and OpenAI
+  document a `prompt_cache_key` field for this, and both recommend one value
+  per conversation, so the workbench now sends the conversation's own id -- the
+  same one that names the saved session, so resuming a conversation asks for
+  the cluster it was using before.
+
+  It goes out only with **Optimize prompt for caching** ticked, and only to
+  Moonshot and OpenAI: the other OpenAI-*compatible* endpoints are proxies of
+  varying strictness, and an unfamiliar field is a plausible way to earn a 400
+  on someone's chat. If you set `prompt_cache_key` yourself in Model
+  Parameters, your value is left alone.
+
+  Whether this is worth anything depends on how your provider load-balances,
+  which is not something the workbench can see. Nothing here changes what the
+  model is shown.
+
+### Fixed
+
+- **Two conversations created in the same millisecond got the same id.** The id
+  is a millisecond timestamp; it names the saved session file, so the collision
+  could already have one conversation overwrite another, and it is now also the
+  cache-routing key above. It now carries six random hex characters as well.
+  Existing saved conversations keep the ids they have.
+
+## [0.26.0-alpha] - 2026-09-14
+
+### Fixed
+
+- **The prompt was arranged so that providers could not cache it, which cost
+  you money on every turn (#47).** Providers discount a prompt whose opening
+  they have seen before, but the match is a *prefix* — it compares from the
+  first token and stops at the first byte that differs. The live document
+  state (your object tree, active Body and selection) sat inside the system
+  prompt, ahead of the skill list, your AGENTS.md and the whole conversation
+  history. Adding a single feature changed it, and nothing behind it matched
+  any more.
+
+  Measured on moonshot/kimi-k2.6 across three Act sessions of 14-19 requests:
+  the cached portion only ever took two values, 12,288 and 14,336, while the
+  prompt climbed to 15,620. Both are multiples of 2,048, and `cache read`
+  matches `floor(previous request's prompt / 2048) x 2048` on 24 of 28
+  consecutive request pairs. Every exception is a turn boundary.
+
+  Three honest caveats on those numbers, two of them corrected after release
+  by Moonshot's engineers ([forum thread
+  602](https://forum.moonshot.ai/t/does-thinking-keep-decide-whether-historical-reasoning-content-counts-toward-the-prefix-cache-on-kimi-k2-6-and-later/602)).
+  A session that small cannot show this fix working: the whole message
+  history fits inside one 2,048-token block, so the billed remainder is
+  essentially the prompt's remainder past the last block boundary whatever we
+  do. The 2,048 figure is a fit to one session and nothing more -- block
+  granularity is configured per cluster and per model, some of Moonshot's
+  configurations use 256 tokens, and a stable prefix size plus whichever
+  cluster happened to serve the request explains the same numbers equally
+  well. And the turn-boundary misses were not all ours to fix: the k2.x
+  series runs *interleaved thinking*, in which some reasoning from earlier
+  turns never enters the model at all -- and what never enters the model is
+  never tokenized, so it cannot reach the prefix cache however faithfully the
+  client replays it. The sessions that gain are the long ones, and the gain
+  is that the history *can* be cached at all -- which it could not be before,
+  at any length.
+
+  On providers that cache automatically and for free — OpenAI, DeepSeek and
+  most OpenAI-compatible endpoints — this silently gave up a discount the
+  workbench already qualified for, and because nothing read the `usage`
+  figures, it did so invisibly.
+
+  The fix is opt-in, under **Settings → Behavior**, and both switches are
+  **off by default** so nothing changes until you choose it:
+
+  - **Optimize prompt for caching.** Moves the document state from the top of
+    the system prompt to the end of your most recent message, and on Anthropic
+    marks a cache point covering the tool list. What this recovers is the
+    system prompt and the conversation history, which grow with the session;
+    the tool list was already cached on providers that cache implicitly.
+
+    Each turn keeps the document snapshot it was actually sent with, so the
+    conversation reproduces byte-for-byte every time it is re-sent — which is
+    the property the cache match depends on. On models that echo their reasoning
+    back into the history — Kimi and the other thinking models — the thinking
+    sent for a turn used to be dropped when that turn was stored, so the next
+    request re-rendered the turn differently and the prefix diverged there;
+    it is now kept, which also means it is written to the saved session and
+    the session log alongside the rest of the turn. Whether that recovers
+    any *money* is up to the provider, and on Kimi it does not: the
+    interleaved thinking described above means earlier reasoning may never
+    reach the cache at all. (An earlier version of this entry said `kimi-k2.6`
+    ignores historical reasoning unless asked not to; its engineers have since
+    confirmed the opposite — the unset default already keeps it.) Keeping it
+    is still the right thing to do, for a reason that has nothing to do with
+    caching; see the Unreleased section. A side effect you will see in a
+    long session is that the transcript carries one snapshot per turn rather
+    than a single live one; they are labelled as the state at the time of that
+    message, and the newest is always the one nearest the model's answer.
+
+    > ⚠️ **This may change the assistant's replies.** The model is shown the
+    > same information, but in a different position, and models are sensitive
+    > to where information sits in a prompt. It is off by default for exactly
+    > this reason. If answers get worse after you enable it, turn it back off
+    > and please open an issue — that outcome is worth knowing about.
+
+  - **Log token usage to the Report view.** Prints one line per reply with the
+    prompt and completion token counts and how much of the prompt was served
+    from cache. Turn this on *first* to see what you are paying now, then turn
+    on the caching option and compare. On OpenAI-style providers this adds a
+    field to the request asking for the counts, which a small number of unusual
+    endpoints may reject; if yours does, turn it back off. If a provider
+    ignores that field and reports nothing, the Report view says so once,
+    rather than leaving you unable to tell a silent provider from a broken
+    setting.
+
+  Notes on scope: the Anthropic cache point is only emitted in Act mode, where
+  the same prefix is re-sent on every tool turn and so pays for itself. Plan
+  mode sends no tools and often only one request, and an Anthropic cache
+  *write* costs more than a normal read, so marking it there would have made
+  Plan mode more expensive rather than less. Providers with an explicit
+  cache-creation API rather than an inline marker — Moonshot and Google among
+  them — are unaffected by the second half and would need separate work.
+  Tool reranking, if you have enabled it, varies the tool list per message and
+  will limit how much of the prompt can be cached whatever these settings say.
+- **Test Connection no longer writes your in-progress Settings edits into the
+  live config, where Cancel could not undo them (#76).** Max Output Tokens,
+  Context Window, Max tool-loop turns, Thinking and the System Prompt were
+  staged in the global config so the probe thread could read two of them back
+  off it; nothing restored them on Cancel, and an unrelated save elsewhere in
+  the session then flushed the cancelled edits to disk. The probe is handed
+  its settings directly now, so there is nothing left to roll back. No API key
+  or connection field was ever involved.
+- **The sandbox pre-check no longer blames your code for a document that was
+  already broken (#82).** An object that fails to recompute stays `Touched`, so
+  FreeCAD re-logs its error on *every* later recompute — including the one your
+  code triggers. The pre-check now records which errors the document emits
+  before your code runs and suppresses exactly those, the same way it already
+  suppressed objects that were invalid to begin with.
+
+### Added
+
+- **The sandbox can see C++ console errors again (#83).** It now reads the
+  headless process's stderr, bracketed by markers around your code, instead of
+  an `App.Console.AddObserver` hook that never installed. FreeCAD's own console
+  warning level is turned off for the run, so the stream carries errors only —
+  a redundant-constraint warning no longer reads like a failure. Failures now
+  name the reason ("NoProfilePad: No object linked") rather than only the
+  symptom ("has null shape").
+
+### Changed
+
+- **The sandbox now says when its console-error channel is unavailable.** The
+  pre-execution sandbox has two ways of noticing a problem: it inspects every
+  object's shape, and it hooks `App.Console.AddObserver` to catch errors the
+  C++ layer prints without raising a Python exception. On FreeCAD 1.1.1 in
+  console mode that method does not exist, so the hook raised `AttributeError`
+  into a bare `except: pass` and the second channel collected nothing on every
+  run — while the sandbox went on reporting success as though it had checked
+  both. The failure is now recorded and logged once per session with the
+  reason. (The channel itself is revived above.)
+
+## [0.25.0-alpha] - 2026-09-13
+
+### Added
+
+- **Cloudflare Workers AI is now a provider preset.** Pick it from the
+  provider dropdown in Settings instead of configuring a Custom endpoint
+  by hand. Its chat-completions endpoint is per-account, so the preset's
+  Base URL ships with an `{ACCOUNT_ID}` placeholder that **you must
+  replace with your own Cloudflare account ID** before the profile will
+  work; supply a Workers AI API token as the API key. The default model
+  is `@cf/moonshotai/kimi-k2.7-code`, which is the model tool calling was
+  verified against. Thanks to @Syeed-MD-Talha.
+- **Settings warns about a Base URL you still have to fill in.** Saving a
+  profile whose Base URL contains an unreplaced `{...}` placeholder now
+  asks first, naming the profile. Previously the literal braces were sent
+  in the request path and came back as a bare 404 that pointed at neither
+  the field nor the fix. This extends the existing blank-Base-URL check,
+  so both problems are reported in one message.
+
+### Fixed
+
+- **Arch/BIM code no longer fails the sandbox pre-check.** Creating an
+  Arch Site, Building or Floor was rejected as "has null shape". These
+  containers are organizational groups that hold no geometry of their
+  own, so a null `Shape` is their normal, valid state for their whole
+  lifetime — the check now recognises them by `Proxy.Type` rather than by
+  a `TypeId` they share with unrelated scripted objects. Thanks to
+  @s-light for finding and fixing this.
+- **An unrelated call no longer gets blamed for a pre-existing problem.**
+  The sandbox snapshots which objects are already broken before running
+  your code, so it can tell what your code actually changed. That
+  snapshot was taken without recomputing the document first, while the
+  post-run check always recomputes — so an object that recomputes
+  differently in the headless sandbox than it did live was missing from
+  the snapshot, and every later call, even a read-only one, was reported
+  as having put it in an Invalid state. Thanks to @s-light.
+
 ## [0.24.0-alpha] - 2026-09-07
 
 ### Added

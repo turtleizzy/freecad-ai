@@ -13,6 +13,7 @@ Provides a GUI for configuring:
 
 import copy
 import os
+import re
 import secrets
 
 from .compat import QtWidgets, QtCore, QtGui
@@ -47,41 +48,53 @@ QInputDialog = QtWidgets.QInputDialog
 from ..config import get_config, save_current_config, PROVIDER_PRESETS, ProviderConfig
 from ..llm.providers import get_provider_names
 
+# Thinking combo index -> config value. Shared by _save and _test_connection.
+_THINKING_VALUES = ["off", "on", "extended"]
+
 
 class _TestConnectionThread(QThread):
     """Background thread for testing LLM connection and detecting capabilities.
 
-    Takes provider/URL/key/model/model_params as arguments rather than
-    reading config — so the user can test before saving, and so a profile
-    that isn't cfg.active_profile can't have its values smuggled into the
-    active one through the singleton (see _TestRerankerThread).
+    Takes everything it needs as arguments rather than reading config — so
+    the user can test before saving, and so a profile that isn't
+    cfg.active_profile can't have its values smuggled into the active one
+    through the singleton (see _TestRerankerThread).
+
+    max_tokens/thinking used to arrive the long way round: the dialog wrote
+    the widget values into the singleton (_save_temp) purely so run() could
+    read them back off it. Nothing undid that on Cancel, and an unrelated
+    save_current_config() elsewhere then flushed cancelled edits to disk
+    (#76). temperature is the saved value: the model-params table carries
+    the dialog's own, and LLMClient lets it win over this fallback.
     """
     finished = Signal(bool, str)        # success, message
     vision_result = Signal(bool)        # vision probe result
     capabilities_result = Signal(dict)  # full caps dict (Ollama: vision/tools/thinking)
 
     def __init__(self, provider_name, base_url, api_key, model,
-                 model_params, parent=None):
+                 model_params, max_tokens, temperature, thinking,
+                 parent=None):
         super().__init__(parent)
         self._provider = provider_name
         self._base_url = base_url
         self._api_key = api_key
         self._model = model
         self._model_params = dict(model_params or {})
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._thinking = thinking
 
     def run(self):
         try:
-            from ..config import get_config
             from ..llm.client import LLMClient
-            cfg = get_config()
             client = LLMClient(
                 provider_name=self._provider,
                 base_url=self._base_url,
                 api_key=self._api_key,
                 model=self._model,
-                max_tokens=cfg.max_tokens,
-                temperature=cfg.temperature,
-                thinking=cfg.thinking,
+                max_tokens=self._max_tokens,
+                temperature=self._temperature,
+                thinking=self._thinking,
                 model_params=self._model_params,
             )
             response = client.test_connection()
@@ -218,6 +231,13 @@ class _TestRerankerThread(QThread):
             self.finished.emit(True, detail)
         except Exception as e:
             self.finished.emit(False, "{}: {}".format(type(e).__name__, e))
+
+
+# Markers a provider preset leaves for the user to fill in, e.g. the
+# {ACCOUNT_ID} in Cloudflare Workers AI's per-account endpoint. Deliberately
+# narrow: only a bare word in braces, so a real URL carrying braces for some
+# other reason is not mistaken for an unfinished one.
+_URL_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z0-9_]+\}")
 
 
 class SettingsDialog(QDialog):
@@ -640,6 +660,65 @@ class SettingsDialog(QDialog):
             self._on_strip_thinking_changed)
         behavior_layout.addWidget(self.strip_thinking_check)
 
+        # Keeping reasoning in history is a reply-quality setting, not a
+        # caching one, which is why it sits here and ships ticked.
+        self.preserve_reasoning_check = QCheckBox(
+            translate("SettingsDialog",
+                      "Keep model reasoning in conversation history")
+        )
+        self.preserve_reasoning_check.setToolTip(
+            translate("SettingsDialog",
+                      "Store the thinking a model produced for a turn and send\n"
+                      "it back with that turn on later requests, which is what\n"
+                      "the provider already saw.\n\n"
+                      "Moonshot report a measurable drop in reply quality on\n"
+                      "turns whose reasoning is missing, so this is on by\n"
+                      "default. Untick it to keep the history as it was before\n"
+                      "v0.27.0-alpha.\n\n"
+                      "Models that reject reasoning in history (e.g. Gemma) are\n"
+                      "unaffected -- \"Strip thinking from conversation\n"
+                      "history\" above still applies.")
+        )
+        behavior_layout.addWidget(self.preserve_reasoning_check)
+
+        # Prompt caching (#47). Both default off, so an existing install
+        # behaves exactly as it did before the upgrade.
+        self.prompt_cache_check = QCheckBox(
+            translate("SettingsDialog",
+                      "Optimize prompt for caching (may change replies)")
+        )
+        self.prompt_cache_check.setToolTip(
+            translate("SettingsDialog",
+                      "Providers discount a prompt they have seen before, but\n"
+                      "only while its opening stays byte-identical. The live\n"
+                      "document state sits at the top of the prompt, so it\n"
+                      "changes every time you add a feature and the discount\n"
+                      "is lost -- including on the much larger tool list\n"
+                      "behind it.\n\n"
+                      "This moves the document state to the end of your last\n"
+                      "message instead, and marks a cache point on Anthropic.\n\n"
+                      "The model still sees the same information, but in a\n"
+                      "different place, so its replies may differ. That is why\n"
+                      "this is off by default.")
+        )
+        behavior_layout.addWidget(self.prompt_cache_check)
+
+        self.log_usage_check = QCheckBox(
+            translate("SettingsDialog", "Log token usage to the Report view")
+        )
+        self.log_usage_check.setToolTip(
+            translate("SettingsDialog",
+                      "Print one line per reply with the prompt and completion\n"
+                      "token counts, and how much of the prompt was served\n"
+                      "from cache.\n\n"
+                      "Turn this on first to see what your requests cost now,\n"
+                      "then turn on the caching option above and compare.\n\n"
+                      "On OpenAI-style providers this adds a field to the\n"
+                      "request asking for the counts, which a few unusual\n"
+                      "endpoints may reject.")
+        )
+        behavior_layout.addWidget(self.log_usage_check)
+
         # System prompt
         prompt_group = QGroupBox(translate("SettingsDialog", "System Prompt"))
         prompt_layout = QVBoxLayout()
@@ -1022,8 +1101,9 @@ class SettingsDialog(QDialog):
 
         # Profile edits stay dialog-local until OK. cfg is the live singleton,
         # so mutating its profiles in place makes Cancel a no-op — and an
-        # unrelated save_current_config() (the vision probe calls one) would
-        # flush a discarded edit to disk.
+        # unrelated save_current_config() (chat_widget's dock-layout change
+        # and Plan/Act toggle both call one) would flush a discarded edit to
+        # disk.
         self._profiles = copy.deepcopy(cfg.profiles)
         self._active_profile = cfg.active_profile
         self._utility_profiles = dict(cfg.utility_profiles)
@@ -1052,6 +1132,11 @@ class SettingsDialog(QDialog):
 
         # Strip thinking history — tristate: PartiallyChecked=auto, Checked=on, Unchecked=off
         self._update_strip_thinking_ui(cfg.strip_thinking_history)
+
+        # Prompt caching (#47)
+        self.preserve_reasoning_check.setChecked(cfg.preserve_reasoning_history)
+        self.prompt_cache_check.setChecked(cfg.optimize_prompt_caching)
+        self.log_usage_check.setChecked(cfg.log_token_usage)
 
         # System prompt text: show override if set, otherwise generate default
         default_prompt = self._get_default_prompt_text()
@@ -1649,6 +1734,21 @@ class SettingsDialog(QDialog):
         self._last_default_prompt = default
 
     @staticmethod
+    def _profiles_with_url_placeholder(profiles) -> list:
+        """Sorted labels of profiles whose Base URL still holds a preset marker.
+
+        A few vendor endpoints are per-account, so their preset cannot ship a
+        complete URL and carries a ``{ACCOUNT_ID}``-style marker for the user
+        to replace. Nothing substitutes it: the literal braces travel in the
+        request path and come back as a 404 naming neither the field nor the
+        fix, so the unreplaced marker has to be caught here instead.
+        """
+        return sorted(
+            label for label, prof in profiles.items()
+            if _URL_PLACEHOLDER_RE.search(
+                getattr(prof, "base_url", "") or ""))
+
+    @staticmethod
     def _profiles_missing_base_url(profiles) -> list:
         """Sorted labels of profiles with no Base URL, which cannot work.
 
@@ -1663,23 +1763,38 @@ class SettingsDialog(QDialog):
             if not (getattr(prof, "base_url", "") or "").strip())
 
     def _confirm_incomplete_profiles(self) -> bool:
-        """Ask before saving a profile that has no Base URL. True to proceed.
+        """Ask before saving a profile that cannot work. True to proceed.
+
+        Covers both ways a Base URL is unusable — blank, or still carrying a
+        preset placeholder — in a single question, so a config with one of
+        each is not two dialogs deep before it can be saved.
 
         A question rather than a refusal: a config may already carry a
         half-filled profile the user never selects, and blocking OK on it
         would strand every unrelated setting in this dialog.
         """
-        incomplete = self._profiles_missing_base_url(self._profiles)
-        if not incomplete:
+        problems = []
+        blank = self._profiles_missing_base_url(self._profiles)
+        if blank:
+            problems.append(translate(
+                "SettingsDialog",
+                "No Base URL is set for: %s.") % ", ".join(blank))
+        unfilled = self._profiles_with_url_placeholder(self._profiles)
+        if unfilled:
+            problems.append(translate(
+                "SettingsDialog",
+                "The Base URL for %s still contains a placeholder such as "
+                "{ACCOUNT_ID}. Replace it with the value from your provider "
+                "account.") % ", ".join(unfilled))
+        if not problems:
             return True
         return QMessageBox.question(
             self,
-            translate("SettingsDialog", "Profile has no Base URL"),
-            translate(
+            translate("SettingsDialog", "Profile cannot be used as set up"),
+            "\n\n".join(problems) + "\n\n" + translate(
                 "SettingsDialog",
-                "No Base URL is set for: %s.\n\nRequests made with such a "
-                "profile fail with a connection error rather than a clear "
-                "message. Save anyway?") % ", ".join(incomplete),
+                "Requests made with such a profile fail with a connection "
+                "error rather than a clear message. Save anyway?"),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No) == QMessageBox.Yes
 
@@ -1724,11 +1839,16 @@ class SettingsDialog(QDialog):
         cfg.auto_execute = self.auto_execute_check.isChecked()
         cfg.keep_dock_on_workbench_switch = self.keep_dock_check.isChecked()
 
-        thinking_values = ["off", "on", "extended"]
-        cfg.thinking = thinking_values[self.thinking_combo.currentIndex()]
+        cfg.thinking = _THINKING_VALUES[self.thinking_combo.currentIndex()]
 
         # Strip thinking history — tristate checkbox
         cfg.strip_thinking_history = self._read_strip_thinking_state()
+
+        # Prompt caching (#47)
+        cfg.preserve_reasoning_history = \
+            self.preserve_reasoning_check.isChecked()
+        cfg.optimize_prompt_caching = self.prompt_cache_check.isChecked()
+        cfg.log_token_usage = self.log_usage_check.isChecked()
 
         # Save system prompt override (empty if user hasn't changed from default)
         custom_text = self.system_prompt_edit.toPlainText().strip()
@@ -1860,13 +1980,13 @@ class SettingsDialog(QDialog):
 
     def _test_connection(self):
         """Test the LLM connection in a background thread."""
-        self._save_temp()
-
         # Resolve provider/URL/key/model/params from the visible widgets
         # directly, rather than through cfg — the visible profile may not be
         # cfg.active_profile (e.g. a profile added but not yet saved), and
         # writing it into the singleton would smuggle it into the wrong
-        # profile (see _save_temp).
+        # profile. The Behavior-tab values below travel the same way, for
+        # the second half of the same reason: nothing rolls a singleton
+        # write back when the user hits Cancel (#76).
         names = get_provider_names()
         idx = self.provider_combo.currentIndex()
         provider_name = names[idx] if 0 <= idx < len(names) else "anthropic"
@@ -1892,7 +2012,13 @@ class SettingsDialog(QDialog):
         self.test_status.setStyleSheet("color: #666;")
 
         self._test_thread = _TestConnectionThread(
-            provider_name, base_url, api_key, model, model_params, self,
+            provider_name, base_url, api_key, model, model_params,
+            max_tokens=self.max_tokens_spin.value(),
+            # The params table supplies the dialog's own temperature and
+            # outranks this inside LLMClient; cfg is only the fallback.
+            temperature=self._cfg.temperature,
+            thinking=_THINKING_VALUES[self.thinking_combo.currentIndex()],
+            parent=self,
         )
         self._test_thread.finished.connect(self._on_test_finished)
         self._test_thread.vision_result.connect(self._on_vision_probed)
@@ -1984,46 +2110,6 @@ class SettingsDialog(QDialog):
                 FreeCAD.Console.PrintMessage(f"FreeCAD AI: {line}\n")
             except ImportError:
                 pass
-
-    def _save_temp(self):
-        """Temporarily apply current UI values to config (for test connection).
-
-        Connection fields (provider/base_url/api_key/model) are deliberately
-        NOT written here — _test_connection reads them straight from the
-        widgets and hands them to _TestConnectionThread, so testing a
-        profile that isn't cfg.active_profile can't leak its values into the
-        active one through this singleton write.
-
-        Model params are the same story: _test_connection reads the table
-        itself and passes it straight to _TestConnectionThread (the vision
-        probe builds its client from that same thread), so writing them
-        into cfg.model_params/cfg.temperature here would feed nothing —
-        it would only leak to disk via the vision-probe's save.
-        """
-        cfg = get_config()
-
-        try:
-            cfg.max_tokens = self.max_tokens_spin.value()
-        except Exception:
-            pass
-        try:
-            cfg.context_window = self.context_window_spin.value()
-        except Exception:
-            pass
-        try:
-            cfg.max_tool_turns = self.max_tool_turns_spin.value()
-        except Exception:
-            pass
-
-        thinking_values = ["off", "on", "extended"]
-        cfg.thinking = thinking_values[self.thinking_combo.currentIndex()]
-
-        custom_text = self.system_prompt_edit.toPlainText().strip()
-        default_text = self._get_default_prompt_text().strip()
-        if custom_text != default_text:
-            cfg.system_prompt_override = custom_text
-        else:
-            cfg.system_prompt_override = ""
 
     @staticmethod
     def _mcp_list_label(entry: dict) -> str:
